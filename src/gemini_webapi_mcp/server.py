@@ -94,10 +94,16 @@ def _stage(label: str, t0: float) -> float:
 # ---------------------------------------------------------------------------
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 _WHITE = 255.0                        # the ✦ is a neutral-white overlay
-_ANCHOR_MARGINS = (96, 32)            # the two corner slots Gemini stamps the ✦ at
+# (logo, margin) pairs Gemini actually uses, native 2K frames. The template asset
+# is 48×48, so logo 96 means the ✦ rendered at twice that size.
+_WM_SLOTS = ((96, 64), (48, 32), (48, 96), (96, 96))
+_CORR_MIN = 0.30                      # winner must look like a ✦ at all (clean corners ≤0.12)
+_ALPHA_MIN = 0.25                     # the ✦ is stamped at ~0.5 opacity; noise stays <0.2
+_ALPHA_MAX = 0.75                     # sanity upper bound for watermark opacity
+_A_STAMP = 132.0 / 255.0              # 0.517647: Gemini's calibrated physical stamp opacity
 _CORR_GHOST = -0.30                   # post-removal corr below this → revert (would ghost)
-_CORR_WORSE = 0.10                    # post-removal |corr| may not grow beyond this
-_wm_shape = None                      # cache: normalized ✦ shape (0..1)
+_wm_shape = None                      # cache: normalized 48² ✦ shape (0..1)
+_wm_shapes: dict = {}                 # cache: normalized ✦ shape per logo size
 
 
 def _load_wm_shape():
@@ -107,18 +113,39 @@ def _load_wm_shape():
     if _wm_shape is None:
         alpha = np.load(_ASSETS_DIR / "wm_alpha_edit.npy").astype(np.float32)
         _wm_shape = alpha / float(alpha.max())
+        _wm_shapes[alpha.shape[0]] = _wm_shape
     return _wm_shape
 
 
 def _shape_at(logo):
-    """The ✦ shape bilinearly resized to `logo` px."""
+    """The ✦ shape at `logo` px, preferring a native-size asset.
+
+    `assets/wm_alpha_edit.npy` is only 48², and resizing it up is a poor stand-in
+    for the real 96² render: the bilinear ramp is 2-3 px softer than Gemini's
+    actual edge. The reverse blend is per-pixel, so those soft-edge pixels — which
+    are really clean background — get subtracted too, and the mark is replaced by
+    a star-shaped OUTLINE (a solid ✦ becomes a hollow one). `wm_alpha_96.npy` is
+    recovered from 35 real frames, so its edge matches what was actually stamped.
+    """
     import numpy as np
     from PIL import Image
+    cached = _wm_shapes.get(logo)
+    if cached is not None:
+        return cached
+    native = _ASSETS_DIR / f"wm_alpha_{logo}.npy"
+    if native.is_file():
+        arr = np.load(native).astype(np.float32)
+        if arr.shape[0] == logo and arr.shape[1] == logo:
+            arr = arr / max(float(arr.max()), 1e-6)
+            _wm_shapes[logo] = arr
+            return arr
     shape = _load_wm_shape()
     if logo == shape.shape[0]:
         return shape
-    return np.asarray(Image.fromarray((shape * 255).astype("uint8")).resize(
+    out = np.asarray(Image.fromarray((shape * 255).astype("uint8")).resize(
         (logo, logo), Image.BILINEAR), np.float32) / 255.0
+    _wm_shapes[logo] = out
+    return out
 
 
 def _plane_bg(g, shape):
@@ -177,17 +204,26 @@ def _estimate_alpha(arr, x0, y0, logo):
 def _remove_watermark(image_path: str, upscaled: bool = False) -> Optional[bool]:
     """Remove the Gemini ✦ from image_path in place by reverse alpha-blend.
 
-    The mark is stamped at one of two fixed corner anchors (margin 96 or 32 from
-    the bottom-right) — absolute offsets that don't depend on resolution. We
-    process BOTH anchors deterministically rather than detecting the mark by
-    correlation: a weak ✦ on a bright/textured background (e.g. snow) has a tiny
-    correlation that no threshold can separate from false matches, but its
-    per-image opacity still measures correctly. On the empty anchor the fitted
-    opacity is ≈0, so the subtraction is a near no-op. A self-check reverts any
-    anchor whose removal would ghost (dark inverse) or otherwise grow |corr| —
-    so subtracting at an empty/textured anchor can never make things worse.
+    Gemini stamps the ✦ at one of a few fixed (logo size, margin) slot combos. We
+    do NOT know which one a given frame used, and we must not guess: subtracting
+    at the wrong slot darkens a star-shaped patch that was never overlaid. That is
+    worse than leaving the mark, because a freshly minted dark ✦ sits at a second
+    location on an otherwise clean frame.
 
-    upscaled doubles the anchors/logo for 2x frames. Returns True if anything was
+    So: score every slot first, take the single best one, and only reverse there.
+      · candidates must carry a real overlay (alpha ≥ _ALPHA_MIN). The stamp is a
+        ~0.5-opacity white overlay, a background-independent quantity, so this gate
+        does not care how bright or busy the underlying picture is — while a texture
+        that merely looks star-shaped fits an opacity far below it;
+      · the winner is the candidate with the highest background-normalized
+        correlation with the ✦ shape, and must clear _CORR_MIN;
+      · after subtraction the winner must IMPROVE — |corr| strictly smaller, no dark
+        ghost, and the residual opacity must drop under _ALPHA_LEFT — or the whole
+        thing is reverted. A wrong-slot guess always worsens its own score, so this
+        catches it even if the correlation floor was fooled.
+    One slot, one edit, no order dependence between slots.
+
+    upscaled doubles the slots for 2x frames. Returns True if anything was
     removed, else None. Honours GEMINI_WM_KEEP=1.
     """
     if os.environ.get("GEMINI_WM_KEEP") == "1":
@@ -207,11 +243,11 @@ def _remove_watermark(image_path: str, upscaled: bool = False) -> Optional[bool]
         return None
 
     try:
-        logo = 96 if upscaled else 48
-        margins = [m * 2 for m in _ANCHOR_MARGINS] if upscaled else list(_ANCHOR_MARGINS)
-        sh = _shape_at(logo)
-        removed = False
-        for margin in margins:
+        slots = (tuple((l * 2, m * 2) for l, m in _WM_SLOTS) if upscaled
+                 else _WM_SLOTS)
+        # ---- phase 1: score every slot, no writes --------------------------
+        scored = []
+        for logo, margin in slots:
             x0, y0 = w - margin - logo, h - margin - logo
             if x0 < 0 or y0 < 0:
                 continue
@@ -219,26 +255,45 @@ def _remove_watermark(image_path: str, upscaled: bool = False) -> Optional[bool]
             if box.shape[0] != logo or box.shape[1] != logo:
                 continue
             A = _estimate_alpha(arr, x0, y0, logo)
-            if A is None or A <= 0.0:
-                continue                          # no overlay here (fit opacity ≈0)
-            before_corr = _star_corr(box, sh)
-            before = arr.copy()
-            alpha = sh * A
-            premult = (alpha * _WHITE)[..., None]
-            _reverse_at(arr, x0, y0, logo, alpha, premult)
-            after = _star_corr(arr[y0:y0 + logo, x0:x0 + logo], sh)
-            if after < _CORR_GHOST or abs(after) > abs(before_corr) + _CORR_WORSE:
-                arr[:] = before                   # would ghost/worsen — revert this anchor
-                logger.info("✦ anchor m%d reverted (corr %.2f→%.2f): %s",
-                            margin, before_corr, after, image_path)
+            if A is None or A < _ALPHA_MIN:
+                # 幅度不够就跳过。实测真水印的 alpha 稳定在 0.45~0.62（印章不透明度约
+                # 0.5，与背景亮度无关）；干净图里的背景纹理最多拟合出 0.1~0.2。
+                # 卡在幅度上而不是相关性上，才不会把「恰好长得像星」的纹理当水印减掉。
                 continue
-            removed = True
-            logger.info("✦ removed at m%d (logo %d A %.2f, corr %.2f→%.2f): %s",
-                        margin, logo, A, before_corr, after, image_path)
-        if removed:
-            Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(image_path)
-            return True
-        return None
+            scored.append((_star_corr(box, _shape_at(logo)), A, logo, margin))
+        if not scored:
+            return None
+        corr0, A, logo, margin = max(scored)
+        if corr0 < _CORR_MIN:
+            # Nothing star-shaped anywhere. Reported once per frame so a silent
+            # miss can't hide again: the previous 48-only code skipped these
+            # without a single log line, which is how it went unnoticed.
+            logger.info("✦ no slot above corr %.2f (best m%d/%d %.2f): %s",
+                        _CORR_MIN, margin, logo, corr0, image_path)
+            return None
+
+        # ---- phase 2: reverse the blend at the winner only ------------------
+        sh = _shape_at(logo)
+        x0, y0 = w - margin - logo, h - margin - logo
+        before = arr.copy()
+        # 核心修复：反向混合使用标定好的真实物理不透明度 _A_STAMP (0.5176)！
+        # 局部平面拟合估算的 A 在非平坦背景（如家具腿、阴影、草地）下会被暗部带偏
+        # （虚高到 0.6+），从而将背景强行扣出暗褐色鬼影星。
+        # 实测平坦背景表明 Google 渲染印章用的是固定通道值 132 (132/255 ≈ 0.5176)。
+        alpha = sh * _A_STAMP
+        premult = (alpha * _WHITE)[..., None]
+        _reverse_at(arr, x0, y0, logo, alpha, premult)
+        after = _star_corr(arr[y0:y0 + logo, x0:x0 + logo], sh)
+        # 回滚检查：不能制造暗星 (after < _CORR_GHOST)，且相关性必须改善
+        if after < _CORR_GHOST or abs(after) >= abs(corr0):
+            arr[:] = before
+            logger.info("✦ slot m%d/%d reverted (corr %.2f→%.2f): %s",
+                        logo, margin, corr0, after, image_path)
+            return None
+        Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(image_path)
+        logger.info("✦ removed at m%d (logo %d stamp A %.3f, corr %.2f→%.2f): %s",
+                    margin, logo, _A_STAMP, corr0, after, image_path)
+        return True
     except Exception as exc:
         logger.warning("watermark removal failed on %s: %s", image_path, exc)
         return None

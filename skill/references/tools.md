@@ -75,10 +75,11 @@ produced.
 
 **Output:** PNG saved to `~/Pictures/gemini/`, 2x upscaled resolution. Returns
 `conversation_id` for continuation. The Gemini ✦ sparkle is removed automatically by the
-server (built-in deterministic reverse alpha-blend; clean on any background). Both fixed
-corner anchors (96 px and 32 px from the bottom-right) are processed every time with a
-per-image opacity fit and a self-check that reverts any subtraction which does not reduce
-the star correlation — no modes, no detection thresholds, no per-conversation state.
+server (built-in deterministic reverse alpha-blend; clean on any background). Evaluates candidate
+corner slots (`(96, 64)`, `(48, 32)`, `(48, 96)`, `(96, 96)`) using native calibrated 96² and 48²
+alpha shape assets (`wm_alpha_96.npy` / `wm_alpha_edit.npy`) and calibrated physical stamp opacity
+(`132/255 ≈ 0.5176`), preventing hollow outlines and dark ghost halos. Clean images receive zero
+pixel modifications. Reverts automatically if star correlation fails to improve.
 Set `GEMINI_WM_KEEP=1` to keep the watermark for diagnostics.
 
 **Resolution (2x upscale):**

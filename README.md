@@ -453,17 +453,16 @@ If the 2x version is unavailable (timeout, network error), the server automatica
 
 ## Watermark Removal
 
-Gemini adds a sparkle watermark (4-point star) to the bottom-right corner of generated images. The server removes it with a built-in reverse alpha-blend — `original = (L − A·shape·255) / (1 − A·shape)` — with no external binaries, ML models, or downloads.
+Gemini adds a sparkle watermark (4-point star) to the bottom-right corner of generated images. The server removes it with a built-in deterministic reverse alpha-blend — `original = (L − A·shape·255) / (1 − A·shape)` — with no external binaries, ML models, or downloads.
 
-The mark is always stamped at one of two fixed corner anchors — **96 px** or **32 px** from the bottom-right (absolute offsets that don't depend on resolution; the logo is 48 px, ×2 when 2x-upscaled). The server does **not** detect the mark by a correlation threshold — that's unreliable on bright backgrounds, where a faint translucent star barely contrasts. Instead it deterministically processes **both anchors**:
+The mark is placed at one of four candidate slots: `(96, 64)`, `(48, 32)`, `(48, 96)`, or `(96, 96)` (supporting both native resolutions and 2x-upscaled outputs). Instead of naively subtracting at multiple slots or guessing, the server employs a two-phase calibrated pipeline:
 
-1. **per-image opacity** — the mark's strength is fit from the frame itself (`L = bg + A·shape·(255−bg)`, least-squares); on an empty anchor `A ≈ 0`, so the subtraction is a no-op;
-2. **reverse alpha-blend** at the anchor;
-3. **|corr| self-check** — a subtraction is accepted only if it *reduces* the correlation with the star shape; otherwise it is reverted. It can never damage an empty, textured, or coloured-content anchor.
+1. **Slot candidate scoring** — evaluates opacity $A$ and normalized star correlation across candidate slots. The frame must contain a genuine watermark ($A \ge 0.25$, $\text{corr} \ge 0.30$), otherwise it is left completely untouched (0 pixel modification on clean images);
+2. **Physical stamp calibration** — rather than relying on noisy local plane fits that get distorted on complex textures or dark clothing, reverse blending anchors to Gemini's calibrated physical stamp opacity ($\_A\_STAMP = 132 / 255 \approx 0.5176$), completely preventing dark ghost halos;
+3. **Calibrated native 96² shape asset** — uses `assets/wm_alpha_96.npy` (extracted via median stacking across real frames) to accurately match the anti-aliased contour of 96 px marks, preventing hollow star outlines;
+4. **Post-removal safety verification** — ensures correlation strictly decreases and no inverse dark ghosts are minted ($\text{after} \ge -0.30$), automatically reverting if anything looks worse.
 
-The approach hard-codes no resolution-dependent values, so it works at any native resolution or aspect ratio — on light, dark, and coloured backgrounds alike.
-
-The only calibrated invariant is the star shape in `src/gemini_webapi_mcp/assets/wm_alpha_edit.npy`. Set `GEMINI_WM_KEEP=1` to disable removal (keep the raw watermark).
+The only calibrated invariants are the star shapes in `src/gemini_webapi_mcp/assets/` (`wm_alpha_edit.npy` for 48² and `wm_alpha_96.npy` for 96²). Set `GEMINI_WM_KEEP=1` to disable removal (keep the raw watermark).
 
 ## Tools
 
